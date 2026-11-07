@@ -13,8 +13,10 @@ from scoring import compute
 load_dotenv()
 MODELS = os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",")
 VOTES = int(os.getenv("VOTES", "3"))  # VOTES=1 — быстрый прогон без голосования
+# в .env можно GEMINI_API_KEY=ключ или несколько через запятую (GEMINI_API_KEY или GEMINI_API_KEYS)
+_KEY0 = (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or "").split(",")[0].strip() or None
 client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY"),
+    api_key=_KEY0,
     http_options=types.HttpOptions(timeout=90000, retry_options=types.HttpRetryOptions(attempts=1)),
 )
 
@@ -367,6 +369,41 @@ def code_rules(conv, cl):
 
 DISCLOSED = re.compile(r"раскры|сообщил|озвучил|disclos", re.I)
 
+# клиент переспрашивает / поправляет оператора сразу после его реплики (ступень «клиенту приходится переспрашивать»)
+REASK = re.compile(
+    r"в как(ом|ой) (меню|разделе|месте|вкладке)|как(ое|ой|ую) (приложение|сайт|меню|раздел|кнопк)|"
+    r"что (вы )?имеете в виду|не понял|не понимаю,? (где|что|куда|на как|о ч)|там (нет|такого нет)|"
+    r"такого (раздела|пункта|меню|нет)|нет такого|кнопки[^.?!]{0,20}нет|я на компьютере|не, я имею в виду|"
+    r"ондай[^.?!]{0,20}жоқ|бөлім жоқ|түсінбедім|қай (жерде|мәзір|бөлім)|"
+    r"where exactly|settings where|what do you mean|there'?s no (login|such|button|sign)|which (menu|app|page|section)|"
+    r"i'?m on the (company )?website|i don'?t see (it|that|such)|not sure what you mean", re.I)
+# модель снизила ведение именно за неотвеченный вопрос (по памятке это снижает только консультацию)
+UNANSWERED = re.compile(r"не ответил|без ответа|игнорир|пропустил[^.]{0,30}вопрос|не на тот вопрос|"
+                        r"оставил[^.]{0,30}вопрос|вопрос[^.]{0,30}(остал|не закрыт|не получил)|отказал[^.]{0,20}поясн", re.I)
+UNCLEAR = re.compile(r"переспр|неясн|непонятн|расплывч|путан|формулировк|поправ", re.I)
+PAID = re.compile(r"скиньте деньги|мне на карту|личный номер|за плату|частн\w* консультац|жеке нөмір|ақылы|"
+                  r"personal number|i charge|private advice|private consult|send me (the )?money", re.I)
+OFFER_WORDS = re.compile(r"платн|обход|личн|частн|карт|деньг|ақылы|paid|private|personal", re.I)
+INDIGNANT = re.compile(r"серь[её]зно|шутите|так говорить не|seriously|are you kidding|шын ба", re.I)
+
+
+def _reask(conv):
+    """Номер реплики клиента, которой он переспросил/поправил оператора сразу после его ответа."""
+    tr, hold, last_op = conv["transcript"], hold_flags(conv), None
+    for i, m in enumerate(tr):
+        if m["speaker"] == "operator" and not hold[i]:
+            last_op = i
+        elif m["speaker"] == "client" and last_op is not None:
+            if REASK.search(m.get("text") or ""):
+                return i
+            last_op = None  # смотрим только первую реплику клиента после ответа оператора
+    return None
+
+
+def _step(c, word):
+    """Значение ступени шкалы, в описании которой есть слово (например, «переспраш»)."""
+    return next((s["value"] for s in c.get("scale") or [] if word in (s.get("desc") or "").lower()), None)
+
 
 def apply_rules(conv, cl, answers):
     notes = []
@@ -390,6 +427,36 @@ def apply_rules(conv, cl, answers):
         if cid in answers and answers[cid].get("answer") != ans:
             notes.append(f"{cid}: модель {answers[cid].get('answer')} → правило {ans}")
             answers[cid] = dict(answers[cid], answer=ans, score=None, explanation=expl)
+
+    # Ведение диалога: клиент переспросил из-за формулировки оператора → ступень «переспрашивать»;
+    # снижено только за неотвеченный вопрос (это уже учтено в консультации) → верхняя ступень
+    dlg = find_crit(cl, "управлени", "переспраш")
+    if dlg and dlg["type"] == "scale" and dlg["id"] in answers and answers[dlg["id"]].get("answer") == "YES":
+        a, low, top = answers[dlg["id"]], _step(dlg, "переспраш"), max(s["value"] for s in dlg["scale"])
+        ri, sc = _reask(conv), a.get("score")
+        if ri is not None and low is not None and sc is not None and sc > low:
+            notes.append(f"{dlg['id']}: модель {sc} → правило {low}")
+            answers[dlg["id"]] = dict(a, score=low, explanation=f"{dlg['name']} — {low}. Клиенту пришлось переспросить или "
+                                      f"поправить оператора после его ответа. Основание — [{ri}].")
+        elif ri is None and sc is not None and top > sc > (low or 0):
+            why = " ".join(str(a.get(k) or "") for k in ("explanation", "reasoning"))
+            if UNANSWERED.search(why) and not UNCLEAR.search(a.get("explanation") or ""):
+                notes.append(f"{dlg['id']}: модель {sc} → правило {top}")
+                answers[dlg["id"]] = dict(a, score=top, explanation=f"{dlg['name']} — {top}. Ответы ясные; неотвеченный вопрос "
+                                          f"учтён в консультации, а не здесь (памятка организаторов). " + (a.get("explanation") or ""))
+
+    # Эмпатия: предложение платной услуги само по себе эмпатию не снижает (это грубая ошибка)
+    emp = find_crit(cl, "эмпати", "недовольств")
+    if emp and emp["id"] in answers and answers[emp["id"]].get("answer") == "NO":
+        tr = conv["transcript"]
+        offer = next((i for i, t in ops if PAID.search(t)), None)
+        why = " ".join(str(answers[emp["id"]].get(k) or "") for k in ("explanation", "reasoning"))
+        later = [m.get("text") or "" for m in tr[offer + 1:] if m["speaker"] == "client"] if offer is not None else []
+        if offer is not None and OFFER_WORDS.search(why) and not any(INDIGNANT.search(t) for t in later):
+            notes.append(f"{emp['id']}: модель NO → правило YES")
+            answers[emp["id"]] = dict(answers[emp["id"]], answer="YES", explanation=f"{emp['name']} — Да. Оператор вежлив; "
+                                      f"предложение платной услуги [{offer}] — это грубая ошибка, эмпатию само по себе "
+                                      f"не снижает (памятка организаторов).")
 
     # раскрытие данных до идентификации — всегда грубая ошибка
     # (только если «Нет» по идентификации поставлено именно за раскрытие сведений)
@@ -473,38 +540,80 @@ class EvalOut(BaseModel):
     criteria: list[CritOut]
 
 
+# Ключи: GEMINI_API_KEYS=ключ1,ключ2,… (у каждого ключа своя квота, если он из отдельного проекта Google).
+KEYS = [k.strip() for k in (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or "").split(",") if k.strip()]
+KEYS = list(dict.fromkeys(KEYS))  # без повторов
+CLIENTS = [genai.Client(api_key=k, http_options=types.HttpOptions(
+    timeout=90000, retry_options=types.HttpRetryOptions(attempts=1))) for k in KEYS[1:]]
+CLIENTS = [client] + CLIENTS
+DAY_DONE = set()  # (модель, номер ключа), у которых кончился дневной лимит
+
+
+def _limit_kind(e):
+    """'key' — ключ не принят, 'day' — дневной лимит, 'minute' — минутный, None — другая ошибка."""
+    s = str(e)
+    if "401" in s or "UNAUTHENTICATED" in s or "API key not valid" in s or "PERMISSION_DENIED" in s:
+        return "key"
+    if "429" not in s and "RESOURCE_EXHAUSTED" not in s and "quota" not in s.lower():
+        return None
+    return "day" if ("PerDay" in s or "per day" in s.lower()) else "minute"
+
+
 def call_llm(prompt, need_ids):
+    """Порядок: основная модель на всех ключах, потом запасная. Минутный лимит — ждём и повторяем
+    ту же модель (не уходим на более слабую); дневной — следующий ключ, затем следующая модель."""
     last = None
     for m in MODELS:
         m = m.strip()
-        for _ in range(2):
-            try:
-                r = client.models.generate_content(
-                    model=m, contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM, temperature=0,
-                        response_mime_type="application/json",
-                        response_schema=EvalOut))
-                data = parse_json(r.text)
-                items = data.get("criteria", [])
-                got = {it.get("id") for it in items}
-                # модель перепутала id (например, c01 вместо greeting), но вернула все критерии по порядку
-                if not (got & set(need_ids)) and len(items) == len(need_ids):
-                    for it, cid in zip(items, need_ids):
-                        it["id"] = cid
-                    got = set(need_ids)
-                missing = [c for c in need_ids if c not in got]
-                if missing:
-                    raise ValueError(f"нет оценок для {missing}")
-                u = r.usage_metadata
-                usage = {"input_tokens": getattr(u, "prompt_token_count", None),
-                         "output_tokens": getattr(u, "candidates_token_count", None)}
-                return data, m, usage
-            except Exception as e:
-                last = e
-                print(f"  {m}: {str(e)[:80]}", flush=True)
-                time.sleep(3)
+        for ki, cli in enumerate(CLIENTS):
+            if (m, ki) in DAY_DONE:
+                continue
+            waits = fails = 0
+            while True:
+                try:
+                    return _ask(cli, m, prompt, need_ids)
+                except Exception as e:
+                    last, kind = e, _limit_kind(e)
+                    print(f"  {m} (ключ {ki + 1}): {str(e)[:80]}", flush=True)
+                    if kind == "day":
+                        DAY_DONE.add((m, ki)); break
+                    if kind == "key":  # неверный ключ — больше его не трогаем ни для какой модели
+                        print(f"  ключ {ki + 1} не принят Google — пропускаю его", flush=True)
+                        DAY_DONE.update((x.strip(), ki) for x in MODELS); break
+                    if kind == "minute" and waits < 4:
+                        waits += 1
+                        time.sleep(15 * waits)  # 15, 30, 45, 60 с — минутное окно освобождается
+                        continue
+                    fails += 1
+                    if fails >= 2 or kind == "minute":
+                        break
+                    time.sleep(3)
     raise RuntimeError(f"Все модели недоступны: {last}")
+
+
+def _ask(cli, m, prompt, need_ids):
+    """Один запрос к модели; ошибка формата ответа — исключение."""
+    r = cli.models.generate_content(
+        model=m, contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM, temperature=0,
+            response_mime_type="application/json",
+            response_schema=EvalOut))
+    data = parse_json(r.text)
+    items = data.get("criteria", [])
+    got = {it.get("id") for it in items}
+    # модель перепутала id (например, c01 вместо greeting), но вернула все критерии по порядку
+    if not (got & set(need_ids)) and len(items) == len(need_ids):
+        for it, cid in zip(items, need_ids):
+            it["id"] = cid
+        got = set(need_ids)
+    missing = [c for c in need_ids if c not in got]
+    if missing:
+        raise ValueError(f"нет оценок для {missing}")
+    u = r.usage_metadata
+    usage = {"input_tokens": getattr(u, "prompt_token_count", None),
+             "output_tokens": getattr(u, "candidates_token_count", None)}
+    return data, m, usage
 
 
 def vote(prompt, ids, llm=None, votes=None):
