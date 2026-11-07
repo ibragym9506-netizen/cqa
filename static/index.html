@@ -700,8 +700,9 @@ body { margin: 0; }
     var E = { sample: null, remote: null, model: '' }, st = null, saveTimer = null, persisted = false;
 
     function fresh() {
-      var cl = clone(defaultChecklist); cl.updated_at = now();
-      var s = { v: 1, checklists: {}, active_checklist: cl.id, judgments: {}, evals: {}, appeals: [], overrides: {}, imported: {} };
+      // исходный чек-лист «старый» (1970): любая сохранённая на сервере версия новее и побеждает при слиянии
+      var cl = clone(defaultChecklist); cl.updated_at = '1970-01-01T00:00:00';
+      var s = { v: 1, checklists: {}, active_checklist: cl.id, active_at: 0, judgments: {}, evals: {}, appeals: [], overrides: {}, imported: {}, stamp: {} };
       s.checklists[cl.id] = cl;
       return s;
     }
@@ -712,13 +713,58 @@ body { margin: 0; }
     var saveOk = true;
     function writeNow() {
       saveTimer = null;
-      try { storage.setItem(KEY, JSON.stringify(st)); saveOk = true; } catch (e) { saveOk = false; /* квота или приватный режим */ }
+      if (storage) { try { storage.setItem(KEY, JSON.stringify(st)); saveOk = true; } catch (e) { saveOk = false; /* квота или приватный режим */ } }
+      if (srv.on) push();
     }
     function save() {
-      if (!storage) return;
+      srv.dirty = true;
       clearTimeout(saveTimer);
       saveTimer = setTimeout(writeNow, 150);
     }
+    /** Отметка «данные диалога изменились в момент t» — по ней сервер сливает правки с разных компьютеров. */
+    function touch(convId, t) { (st.stamp || (st.stamp = {}))[convId] = t || Date.now(); }
+
+    // ---- общее хранилище на сервере (server.py: /api/state → data/state.json) ----
+    // Каждое изменение отправляется на сервер, сервер сливает его с правками других пользователей
+    // (по отметкам времени) и возвращает общий результат. Раз в несколько секунд — проверка обновлений.
+    var srv = { on: false, version: -1, dirty: false, busy: false, again: false, onChange: null, timer: null };
+    function adopt(s, version) {
+      var before = JSON.stringify(st);
+      st = s; if (!st.stamp) st.stamp = {};
+      srv.version = version;
+      if (storage) { try { storage.setItem(KEY, JSON.stringify(st)); } catch (e) { /* ничего */ } }
+      return before !== JSON.stringify(st);
+    }
+    function push() {
+      if (srv.busy) { srv.again = true; return Promise.resolve(); }
+      srv.busy = true; srv.dirty = false;
+      var sent = JSON.stringify(st);
+      return fetch(E.remote + '/api/state', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ state: st }) })
+        .then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+          srv.busy = false;
+          if (!j || !j.state) { srv.dirty = true; return; }
+          if (JSON.stringify(st) !== sent) { srv.again = true; } // пока шёл запрос, появились новые правки — отправим ещё раз
+          else if (adopt(j.state, j.version) && srv.onChange) srv.onChange();
+          if (srv.again) { srv.again = false; push(); }
+        }, function () { srv.busy = false; srv.dirty = true; });
+    }
+    function poll() {
+      if (!srv.on || srv.busy) return;
+      if (global.document && global.document.visibilityState === 'hidden') return;
+      if (srv.dirty) { push(); return; }
+      fetch(E.remote + '/api/state?v=' + srv.version).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+        if (!j || j.version === srv.version || !j.state || srv.dirty || srv.busy) return;
+        if (adopt(j.state, j.version) && srv.onChange) srv.onChange();
+      }, function () { /* сервер недоступен — работаем с локальной копией */ });
+    }
+    /** Подключить общее хранилище: отправляем свою копию (сервер сольёт) и забираем общий результат. */
+    E.attachServer = function (onChange) {
+      srv.on = true; srv.onChange = onChange || null;
+      return push().then(function () {
+        clearInterval(srv.timer); srv.timer = setInterval(poll, 4000);
+        return srv.version >= 0;
+      });
+    };
     function flush() { if (saveTimer) { clearTimeout(saveTimer); writeNow(); } } // закрытие вкладки или перезагрузка не должны терять последние изменения
     if (storage && typeof global.addEventListener === 'function') {
       global.addEventListener('pagehide', flush);
@@ -727,6 +773,8 @@ body { margin: 0; }
     }
     function init() {
       st = load() || fresh();
+      if (!st.stamp) st.stamp = {};
+      if (st.active_at == null) st.active_at = 0;
       if (!persisted && opts.autoRules !== false) { // первый запуск: быстрая эвристическая оценка, чтобы сводка не была пустой
         var cl = st.checklists[st.active_checklist];
         allIds().forEach(function (id) { evalRules(id, cl); });
@@ -806,7 +854,9 @@ body { margin: 0; }
         var r; try { r = normRecord(clone(r0)); } catch (err) { bad.push('#' + (k + 1) + ': ' + err.message); return; }
         if (group) r.group = String(group); else if (!r.group) r.group = 'Загружено';
         var old = st.imported[r.conversation_id] || seedIds[r.conversation_id];
-        if (old && JSON.stringify(old.transcript) !== JSON.stringify(r.transcript)) { delete st.judgments[r.conversation_id]; delete st.overrides[r.conversation_id]; }
+        if (old && JSON.stringify(old.transcript) !== JSON.stringify(r.transcript)) { delete st.judgments[r.conversation_id]; delete st.evals[r.conversation_id]; delete st.overrides[r.conversation_id]; touch(r.conversation_id); }
+        var prevImp = st.imported[r.conversation_id];
+        r.imported_at = prevImp && JSON.stringify([prevImp.transcript, prevImp.audio_url, prevImp.group]) === JSON.stringify([r.transcript, r.audio_url, r.group]) ? (prevImp.imported_at || 0) : Date.now();
         st.imported[r.conversation_id] = r; added++;
       });
       save();
@@ -814,7 +864,8 @@ body { margin: 0; }
       return { imported: added, skipped: bad, total: allIds().length, group: group ? String(group) : 'Загружено' };
     }
 
-    function addJudgments(convId, cl, todo, res, source, usage) {
+    function addJudgments(convId, cl, todo, res, source, usage, stampAt) {
+      touch(convId, stampAt);
       var judg = st.judgments[convId] || (st.judgments[convId] = {});
       todo.forEach(function (c) { var j = res[c.id]; j.source = source; judg[criterionHash(c)] = j; });
       var prev = st.evals[convId] || { calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 };
@@ -1008,7 +1059,7 @@ body { margin: 0; }
           src.id = nid; src.name = body.name || src.name + ' (копия)'; src.updated_at = now(); st.checklists[nid] = src; save();
           return clone(src);
         }
-        if (method === 'POST' && parts.length === 3 && parts[2] === 'activate') { getChecklist(parts[1]); st.active_checklist = parts[1]; save(); return { active: parts[1] }; }
+        if (method === 'POST' && parts.length === 3 && parts[2] === 'activate') { getChecklist(parts[1]); st.active_checklist = parts[1]; st.active_at = Date.now(); save(); return { active: parts[1] }; }
         if (method === 'PUT' && parts.length === 2) return clone(saveChecklist(parts[1], clone(body)));
         if (method === 'DELETE' && parts.length === 2) {
           if (parts[1] === st.active_checklist) throw ApiError('Нельзя удалить активный чек-лист');
@@ -1063,7 +1114,7 @@ body { margin: 0; }
         // если по диалогу не было живой оценки и апелляций
         var ev0 = st.evals[cid], mt = Number(res.mtime || 0);
         if (ev0 && ev0.batch && mt > (ev0.batch_mtime || 0) && !st.appeals.some(function (a) { return a.conversation_id === cid; })) {
-          delete st.judgments[cid]; delete st.evals[cid]; delete st.overrides[cid];
+          delete st.judgments[cid]; delete st.evals[cid]; delete st.overrides[cid]; touch(cid, mt * 1000);
         }
         var judg = st.judgments[cid] || {}, nm = rec.transcript.length, add = {}, notes = {};
         (res.rule_overrides || []).forEach(function (s) { var p = String(s).split(':'); notes[p[0].trim()] = p.slice(1).join(':').trim(); });
@@ -1081,7 +1132,7 @@ body { margin: 0; }
         });
         var todo = cl.criteria.filter(function (c) { return add[c.id]; });
         if (!todo.length) return;
-        addJudgments(cid, cl, todo, add, 'gemini', { calls: 0, input_tokens: 0, output_tokens: 0 });
+        addJudgments(cid, cl, todo, add, 'gemini', { calls: 0, input_tokens: 0, output_tokens: 0 }, Math.max(mt * 1000, (st.stamp || {})[cid] || 0));
         var ev = st.evals[cid]; ev.model = res.model || ''; ev.batch = true; ev.batch_mtime = mt; ev.needs_review = !!res.needs_review; n++;
       });
       if (n) save();
@@ -1831,11 +1882,30 @@ body { margin: 0; }
     function setModel(m, server) {
       S.model = m; S.server = !!server; S.modelName = m ? String(m).replace(/^Gemini · /, '') : '';
       var st = $('#status'); st.className = 'cqa-status' + (m ? ' on' : '');
-      st.innerHTML = '<i></i><b>' + (m ? esc(m) : server ? 'Сервер без модели' : 'Без сервера — только эвристики') + '</b>';
+      st.innerHTML = '<i></i><b>' + (m ? esc(m) : server ? 'Нет ключа Gemini — эвристики' + (S.shared ? ' · общее хранилище' : '') : 'Без сервера — только эвристики') + '</b>';
+      st.title = S.shared ? 'Чек-листы, оценки и апелляции хранятся на сервере (data/state.json) и общие для всех, кто открыл сайт' :
+        'Данные хранятся в этом браузере';
+    }
+    /** Пришли правки других пользователей: обновляем данные и перерисовываем, не трогая то, что человек сейчас вводит. */
+    function remoteChanged() {
+      var openBefore = S.appeals.filter(function (a) { return a.status === 'open'; }).length;
+      return loadChecklist().then(loadLists).then(loadConvs).then(loadAppeals).then(function () {
+        var openNow = S.appeals.filter(function (a) { return a.status === 'open'; }).length;
+        if (openNow > openBefore) toast('Новая апелляция от другого пользователя — раздел «Апелляции»');
+        var r = location.hash.replace(/^#\/?/, '').split('/')[0] || 'list';
+        var focused = document.activeElement && root.contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+        var typed = Array.prototype.some.call(page.querySelectorAll('textarea'), function (t) { return t.value.trim(); });
+        if (S.runner && S.runner.running) return;
+        if (r === 'list' && !S.paste && !focused) drawList();
+        else if (r === 'appeals' && !typed && !focused) drawAppeals();
+        else if (r === 'd' && S.rec && !S.form && !focused) openDialog(S.rec.conversation_id);
+        else if (r === 'checklist' && !S.dirty) { S.edit = null; drawChecklist(); }
+      });
     }
     loadChecklist().then(loadLists).then(loadConvs).then(loadAppeals).then(route).catch(function (e) { page.innerHTML = '<div class="note bad">Не удалось загрузить данные: ' + esc(e.message) + '</div>'; });
     return {
-      online: function (model, votesN, asr) { S.votes = votesN || 3; S.asr = !!asr; setModel(model, true); return loadConvs().then(route); }
+      online: function (model, votesN, asr, shared) { S.votes = votesN || 3; S.asr = !!asr; S.shared = !!shared; S.noKey = !model; setModel(model ? model + (shared ? ' · общее хранилище' : '') : null, true); return loadChecklist().then(loadLists).then(loadConvs).then(loadAppeals).then(route); },
+      remoteChanged: function () { return remoteChanged(); }
     };
   }
   global.CQA = { mount: mount };
@@ -1854,8 +1924,10 @@ body { margin: 0; }
   fetch(base + '/api/health').then(function (r) { return r.ok ? r.json() : null; }).then(function (h) {
     if (!h || !h.ok) return;
     engine.setRemote(base, h.model);
-    return fetch(base + '/api/precomputed').then(function (r) { return r.ok ? r.json() : {}; }).catch(function () { return {}; })
-      .then(function (pre) { engine.preload(pre); return ui.online('Gemini · ' + h.model, h.votes, h.asr); });
+    // общее хранилище на сервере: сначала сливаем свою копию с серверной, потом подставляем готовые оценки
+    var shared = engine.attachServer(function () { ui.remoteChanged(); }).catch(function () { return false; });
+    var pre = fetch(base + '/api/precomputed').then(function (r) { return r.ok ? r.json() : {}; }).catch(function () { return {}; });
+    return Promise.all([shared, pre]).then(function (x) { engine.preload(x[1]); return ui.online(h.llm === false ? null : 'Gemini · ' + h.model, h.votes, h.asr, x[0]); });
   }).catch(function () { /* сервер недоступен — только эвристики */ });
 })();
 </script>

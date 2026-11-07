@@ -146,7 +146,8 @@ def health():
         asr = True
     except ImportError:
         asr = False
-    return {"ok": True, "provider": "gemini", "model": ev.MODELS[0].strip(), "votes": ev.VOTES, "asr": asr}
+    return {"ok": True, "provider": "gemini", "model": ev.MODELS[0].strip(), "votes": ev.VOTES, "asr": asr,
+            "llm": bool(ev.CLIENTS), "keys": len(ev.CLIENTS)}
 
 
 @app.post("/api/llm/evaluate")
@@ -254,6 +255,106 @@ def audio(u: str):
         raise HTTPException(502, f"Не удалось открыть запись: {str(e)[:200]}")
 
 
+# ---------- общее хранилище: чек-листы, оценки, апелляции, решения (data/state.json) ----------
+STATE_FILE = os.path.join(BASE, "data", "state.json")
+STATE_LOCK = threading.Lock()
+_state = {"version": 0, "state": None}
+
+
+def _load_state():
+    if _state["state"] is None and os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+            _state.update(version=saved.get("version", 0), state=saved.get("state"))
+        except Exception:
+            pass  # битый файл — начнём заново, старый не трогаем
+    return _state
+
+
+def merge_state(a, b):
+    """Слияние правок двух пользователей. a — то, что на сервере, b — пришло из браузера.
+    Чек-листы — побеждает более новая версия; апелляции — объединение, решение важнее открытой;
+    оценки по диалогу — побеждает более свежая отметка изменения; решения проверяющего — объединение."""
+    if not a:
+        return b
+    if not b:
+        return a
+    out = dict(a)
+    cls = dict(a.get("checklists") or {})
+    for k, v in (b.get("checklists") or {}).items():
+        if k not in cls or str(v.get("updated_at") or "") > str(cls[k].get("updated_at") or ""):
+            cls[k] = v
+    out["checklists"] = cls
+    if (b.get("active_at") or 0) > (a.get("active_at") or 0) and b.get("active_checklist") in cls:
+        out["active_checklist"], out["active_at"] = b["active_checklist"], b["active_at"]
+    if out.get("active_checklist") not in cls and cls:
+        out["active_checklist"] = next(iter(cls))
+    sa, sb = a.get("stamp") or {}, b.get("stamp") or {}
+    convs = set(sa) | set(sb)
+    for f in ("judgments", "evals"):
+        convs |= set(a.get(f) or {}) | set(b.get(f) or {})
+    stamp = {}
+    for f in ("judgments", "evals"):
+        da, db, res = a.get(f) or {}, b.get(f) or {}, {}
+        for c in convs:
+            ta, tb = sa.get(c, 0), sb.get(c, 0)
+            src = db if tb > ta else da if ta > tb else (da if c in da else db)
+            if c in src:
+                res[c] = src[c]
+        out[f] = res
+    for c in convs:
+        stamp[c] = max(sa.get(c, 0), sb.get(c, 0))
+    out["stamp"] = stamp
+    imp = dict(a.get("imported") or {})
+    for k, v in (b.get("imported") or {}).items():
+        if k not in imp or (v.get("imported_at") or 0) > (imp[k].get("imported_at") or 0):
+            imp[k] = v
+    out["imported"] = imp
+    ovr = {k: dict(v) for k, v in (a.get("overrides") or {}).items()}
+    for c, items in (b.get("overrides") or {}).items():
+        cur = ovr.setdefault(c, {})
+        for h, o in items.items():
+            if h not in cur or str(o.get("decided_at") or "") > str(cur[h].get("decided_at") or ""):
+                cur[h] = o
+    out["overrides"] = ovr
+    aps = {x["id"]: x for x in a.get("appeals") or [] if x.get("id")}
+    for x in b.get("appeals") or []:
+        y = aps.get(x.get("id"))
+        if y is None or (y.get("status") == "open" and x.get("status") != "open"):
+            aps[x["id"]] = x
+    out["appeals"] = sorted(aps.values(), key=lambda x: str(x.get("created_at") or ""))
+    out["v"] = 1
+    return out
+
+
+@app.get("/api/state")
+def get_state(v: int = -1):
+    with STATE_LOCK:
+        st = _load_state()
+        if v == st["version"]:
+            return {"version": st["version"]}  # ничего не менялось — без лишнего трафика
+        return {"version": st["version"], "state": st["state"]}
+
+
+@app.put("/api/state")
+def put_state(body: dict = Body(...)):
+    incoming = body.get("state")
+    if not isinstance(incoming, dict) or not isinstance(incoming.get("checklists"), dict):
+        raise HTTPException(400, "Нужен state с checklists")
+    with STATE_LOCK:
+        st = _load_state()
+        merged = merge_state(st["state"], incoming)
+        if merged != st["state"]:
+            st["state"], st["version"] = merged, st["version"] + 1
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": st["version"], "state": merged}, f, ensure_ascii=False)
+            os.replace(tmp, STATE_FILE)  # атомарно: при сбое не останется полузаписанного файла
+        return {"version": st["version"], "state": st["state"]}
+
+
 CODES = ["contact", "discovery", "identification", "consultation", "empathy", "dialogue", "closure", "critical"]
 
 
@@ -310,5 +411,13 @@ if os.path.isdir(STATIC):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
+    host = os.getenv("HOST", "127.0.0.1")  # HOST=0.0.0.0 — открыть сайт с других устройств в той же сети
     print(f"CQA: откройте http://localhost:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    if host == "0.0.0.0":
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
+            print(f"     с других устройств в этой сети: http://{s.getsockname()[0]}:{port}")
+        except OSError:
+            pass
+    uvicorn.run(app, host=host, port=port)

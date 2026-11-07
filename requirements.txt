@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-genai
+python-dotenv
+pydantic
+# распознавание речи для привязки реплик звонков к записи (tools/audio_sync.py)
+sherpa-onnx
+soundfile
+numpy

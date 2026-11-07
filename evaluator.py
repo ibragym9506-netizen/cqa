@@ -15,10 +15,11 @@ MODELS = os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite
 VOTES = int(os.getenv("VOTES", "3"))  # VOTES=1 — быстрый прогон без голосования
 # в .env можно GEMINI_API_KEY=ключ или несколько через запятую (GEMINI_API_KEY или GEMINI_API_KEYS)
 _KEY0 = (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or "").split(",")[0].strip() or None
+# без ключа сервер всё равно запускается: интерфейс работает на эвристиках и готовых оценках
 client = genai.Client(
     api_key=_KEY0,
     http_options=types.HttpOptions(timeout=90000, retry_options=types.HttpRetryOptions(attempts=1)),
-)
+) if _KEY0 else None
 
 SYSTEM = """Ты — строгий эксперт по контролю качества клиентской поддержки брокерской компании Freedom Broker.
 Оцени работу ОПЕРАТОРА по чек-листу. Будь строгим: «Да» и высший балл — только если требование выполнено полностью.
@@ -387,6 +388,13 @@ OFFER_WORDS = re.compile(r"платн|обход|личн|частн|карт|д
 INDIGNANT = re.compile(r"серь[её]зно|шутите|так говорить не|seriously|are you kidding|шын ба", re.I)
 
 
+# сведения, взятые из счёта клиента, или защищённое действие — только тогда идентификация была нужна
+ACCOUNT_INFO = re.compile(
+    r"на вашем (брокерском )?сч[её]те|я посмотрел|вижу (на|в) ваш|ваш(е|и|а)? (поручени|позици|баланс|сч[её]т)\w* (в|на|есть|ограничен)|"
+    r"шотыңызда|көріп тұрмын|i can see[^.]{0,40}(account|restriction|position|order)|on your account|your (order|position|balance) (is|was|has)|"
+    r"отменил|оформил (вам|ваш)|заблокировал|разблокировал|сбросил|поручение принято|cancel+ed your|i'?ve (blocked|unblocked|reset)", re.I)
+
+
 def _reask(conv):
     """Номер реплики клиента, которой он переспросил/поправил оператора сразу после его ответа."""
     tr, hold, last_op = conv["transcript"], hold_flags(conv), None
@@ -427,6 +435,19 @@ def apply_rules(conv, cl, answers):
         if cid in answers and answers[cid].get("answer") != ans:
             notes.append(f"{cid}: модель {answers[cid].get('answer')} → правило {ans}")
             answers[cid] = dict(answers[cid], answer=ans, score=None, explanation=expl)
+
+    # Идентификация: «Нет» без раскрытия сведений из счёта и без защищённого действия — это не нарушение,
+    # проверка просто не требовалась (догадка оператора «наверное, биржа отменяет» — ошибка консультации)
+    idc0 = find_crit(cl, "идентификац", "личност")
+    if idc0 and idc0.get("na_allowed") and answers.get(idc0["id"], {}).get("answer") == "NO" \
+            and conv.get("channel") != "voice call":
+        verified = any(m["speaker"] == "system" and _has(_low(m), ID_OK) for m in conv["transcript"])
+        asked = any(re.search(r"идентификац|подтверд\w* личност|жеке бас|verify your identity", t, re.I) for _, t in ops)
+        if not verified and not asked and not any(ACCOUNT_INFO.search(t) for _, t in ops):
+            notes.append(f"{idc0['id']}: модель NO → правило NA")
+            answers[idc0["id"]] = dict(answers[idc0["id"]], answer="NA", explanation=f"{idc0['name']} — N/A. Оператор не "
+                                       f"раскрывал сведений из счёта клиента и не выполнял защищённых действий — проверка "
+                                       f"личности не требовалась.")
 
     # Ведение диалога: клиент переспросил из-за формулировки оператора → ступень «переспрашивать»;
     # снижено только за неотвеченный вопрос (это уже учтено в консультации) → верхняя ступень
@@ -545,15 +566,17 @@ KEYS = [k.strip() for k in (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_AP
 KEYS = list(dict.fromkeys(KEYS))  # без повторов
 CLIENTS = [genai.Client(api_key=k, http_options=types.HttpOptions(
     timeout=90000, retry_options=types.HttpRetryOptions(attempts=1))) for k in KEYS[1:]]
-CLIENTS = [client] + CLIENTS
+CLIENTS = ([client] if client else []) + CLIENTS
 DAY_DONE = set()  # (модель, номер ключа), у которых кончился дневной лимит
 
 
 def _limit_kind(e):
-    """'key' — ключ не принят, 'day' — дневной лимит, 'minute' — минутный, None — другая ошибка."""
+    """'key' — ключ не принят, 'busy' — модель перегружена/таймаут, 'day' — дневной лимит, 'minute' — минутный."""
     s = str(e)
     if "401" in s or "UNAUTHENTICATED" in s or "API key not valid" in s or "PERMISSION_DENIED" in s:
         return "key"
+    if any(x in s for x in ("503", "504", "500 ", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "overloaded", "high demand")):
+        return "busy"
     if "429" not in s and "RESOURCE_EXHAUSTED" not in s and "quota" not in s.lower():
         return None
     return "day" if ("PerDay" in s or "per day" in s.lower()) else "minute"
@@ -562,11 +585,14 @@ def _limit_kind(e):
 def call_llm(prompt, need_ids):
     """Порядок: основная модель на всех ключах, потом запасная. Минутный лимит — ждём и повторяем
     ту же модель (не уходим на более слабую); дневной — следующий ключ, затем следующая модель."""
+    if not CLIENTS:
+        raise RuntimeError("Нет ключа Gemini: добавьте GEMINI_API_KEY в файл .env и перезапустите сервер")
     last = None
     for m in MODELS:
         m = m.strip()
+        busy = 0  # перегрузка/таймаут — беда самой модели, а не ключа: после 3 таких ошибок идём к следующей модели
         for ki, cli in enumerate(CLIENTS):
-            if (m, ki) in DAY_DONE:
+            if (m, ki) in DAY_DONE or busy >= 3:
                 continue
             waits = fails = 0
             while True:
@@ -580,6 +606,12 @@ def call_llm(prompt, need_ids):
                     if kind == "key":  # неверный ключ — больше его не трогаем ни для какой модели
                         print(f"  ключ {ki + 1} не принят Google — пропускаю его", flush=True)
                         DAY_DONE.update((x.strip(), ki) for x in MODELS); break
+                    if kind == "busy":
+                        busy += 1
+                        if busy >= 3:
+                            break
+                        time.sleep(5)
+                        continue
                     if kind == "minute" and waits < 4:
                         waits += 1
                         time.sleep(15 * waits)  # 15, 30, 45, 60 с — минутное окно освобождается
