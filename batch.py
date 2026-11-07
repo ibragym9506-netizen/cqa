@@ -22,4 +22,4 @@ for i, conv in enumerate(records, 1):
         print(f"[{i}/{len(records)}] {cid} -> {res['total']}  грубая={res['gross_error']}", flush=True)
     except Exception as e:
         print(f"[{i}/{len(records)}] {cid} ОШИБКА: {str(e)[:100]}", flush=True)
-    time.sleep(3)  # чтобы не упереться в лимит бесплатного тарифа
+    time.sleep(10)  # чтобы не упереться в лимит бесплатного тарифа
