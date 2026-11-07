@@ -55,7 +55,7 @@ def main():
             hit = got.get(c) == exp
             ok += hit
             print(f"    {'OK ' if hit else 'НЕТ'} {names[c]}: было {was.get(c)}, стало {got.get(c)}, по проверке {exp}", flush=True)
-        time.sleep(5)  # лимит бесплатного тарифа: 15 запросов в минуту
+        time.sleep(15)  # лимит бесплатного тарифа: 15 запросов в минуту (3 прогона на диалог)
     if total:
         print(f"\nСовпало с ручной проверкой: {ok} из {total}")
 

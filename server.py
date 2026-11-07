@@ -294,7 +294,7 @@ def precomputed():
                 continue
             keep = ("id", "name", "answer", "score", "explanation", "quote", "evidence", "checked_range")
             out[r.get("conversation_id") or name[:-5]] = {
-                "model": r.get("model"), "agreement": r.get("agreement") or {},
+                "mtime": int(os.path.getmtime(os.path.join(folder, name))), "model": r.get("model"), "agreement": r.get("agreement") or {},
                 "rule_overrides": r.get("rule_overrides") or [], "needs_review": r.get("needs_review"),
                 "criteria": [{k: c.get(k) for k in keep} for c in r.get("criteria") or []]}
     return out

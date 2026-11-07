@@ -3,3 +3,5 @@ venv/
 __pycache__/ 
 datathon* 
 audio/
+sync_cache/
+results/chat_v1_old/

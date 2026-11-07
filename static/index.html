@@ -904,7 +904,7 @@ body { margin: 0; }
       busy[id] = true;
       return evaluateLLM(rec, todo, force).then(function (r) {
         addJudgments(id, cl, todo, r.res, E.remote !== null ? 'gemini' : 'claude', r.usage);
-        if (r.meta) { var ev = st.evals[id]; ev.model = r.meta.model; ev.needs_review = r.meta.needs_review; ev.rule_overrides = r.meta.rule_overrides; save(); }
+        if (r.meta) { var ev = st.evals[id]; ev.batch = false; ev.model = r.meta.model; ev.needs_review = r.meta.needs_review; ev.rule_overrides = r.meta.rule_overrides; save(); }
         return buildView(id, cl);
       }).then(function (v) { delete busy[id]; return v; }, function (e) { delete busy[id]; throw e; });
     }
@@ -1059,6 +1059,12 @@ body { margin: 0; }
         if (!rec || !res || !Array.isArray(res.criteria) || !seedIds[cid]) return;
         // контрольный набор может повторять ID из DEV: готовые оценки только для тех же самых реплик
         if (rec !== seedIds[cid] && JSON.stringify(rec.transcript) !== JSON.stringify(seedIds[cid].transcript)) return;
+        // файл пакетного прогона обновился (py recheck.py / batch.py) — заменяем старые пакетные оценки,
+        // если по диалогу не было живой оценки и апелляций
+        var ev0 = st.evals[cid], mt = Number(res.mtime || 0);
+        if (ev0 && ev0.batch && mt > (ev0.batch_mtime || 0) && !st.appeals.some(function (a) { return a.conversation_id === cid; })) {
+          delete st.judgments[cid]; delete st.evals[cid]; delete st.overrides[cid];
+        }
         var judg = st.judgments[cid] || {}, nm = rec.transcript.length, add = {}, notes = {};
         (res.rule_overrides || []).forEach(function (s) { var p = String(s).split(':'); notes[p[0].trim()] = p.slice(1).join(':').trim(); });
         var names = {}; res.criteria.forEach(function (r) { names[r.id] = r.name; });
@@ -1076,7 +1082,7 @@ body { margin: 0; }
         var todo = cl.criteria.filter(function (c) { return add[c.id]; });
         if (!todo.length) return;
         addJudgments(cid, cl, todo, add, 'gemini', { calls: 0, input_tokens: 0, output_tokens: 0 });
-        var ev = st.evals[cid]; ev.model = res.model || ''; ev.batch = true; ev.needs_review = !!res.needs_review; n++;
+        var ev = st.evals[cid]; ev.model = res.model || ''; ev.batch = true; ev.batch_mtime = mt; ev.needs_review = !!res.needs_review; n++;
       });
       if (n) save();
       return n;
