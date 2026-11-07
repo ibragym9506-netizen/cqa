@@ -1,3 +1,12 @@
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def r2(x):
+    """Округление до двух знаков «половина вверх» (63.125 → 63.13), как в интерфейсе.
+    Встроенный round() округляет к чётному (63.125 → 63.12)."""
+    return float(Decimal(repr(float(x))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def _max_scale(c):
     return max(s["value"] for s in c["scale"])
 
@@ -48,9 +57,9 @@ def compute(checklist, answers):
         k = 100.0 / applicable_weight  # перераспределение весов N/A
         for r in rows:
             if r["raw_points"] is not None:
-                r["points"] = round(r["raw_points"] * k, 2)
-                r["max_points"] = round(r["weight"] * k, 2)
-        total = round(sum(r["raw_points"] for r in rows if r["raw_points"] is not None) * k, 2)
+                r["points"] = r2(r["raw_points"] * k)
+                r["max_points"] = r2(r["weight"] * k)
+        total = r2(sum(r["raw_points"] for r in rows if r["raw_points"] is not None) * k)
 
     sections = {}
     for r in rows:
@@ -60,8 +69,8 @@ def compute(checklist, answers):
         s["points"] += r["points"]
         s["max"] += r["max_points"]
     for s in sections.values():
-        s["points"] = round(s["points"], 2)
-        s["max"] = round(s["max"], 2)
+        s["points"] = r2(s["points"])
+        s["max"] = r2(s["max"])
 
     gross = any(r["type"] == "flag" and r["answer"] == "YES" for r in rows)
 

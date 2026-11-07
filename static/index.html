@@ -139,6 +139,7 @@ body { margin: 0; }
 .cqa-crit.focus { box-shadow: 0 0 0 2px var(--accent); }
 .cqa-crit-h { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
 .cqa-crit-h h3 { font-size: 15px; font-weight: 650; }
+.cqa-crit-h > div:first-child { min-width: 0; overflow-wrap: anywhere; }
 .cqa-crit-h .meta { font-size: 12px; color: var(--mute); }
 .cqa-crit-h .r { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
 .cqa-crit-h .pts { font-size: 12px; color: var(--mute); font-variant-numeric: tabular-nums; }
@@ -680,7 +681,8 @@ body { margin: 0; }
     var tr = r.transcript || r.messages || r.dialog || [];
     if (typeof tr === 'string') { try { tr = JSON.parse(tr); } catch (e) { tr = parseTextTranscript(tr); } }
     if (!Array.isArray(tr)) throw ApiError('У записи ' + (r.conversation_id || '') + ' transcript не список реплик');
-    r.transcript = tr.map(function (m) { return typeof m === 'string' ? { text: m } : m; }).filter(function (m) { return m && typeof m === 'object'; }).map(function (m) {
+    // элементы-не-объекты не выбрасываем: номера реплик (evidence_turns) считаются по исходному массиву
+    r.transcript = tr.map(function (m) { return m && typeof m === 'object' && !Array.isArray(m) ? m : { text: m == null ? '' : String(m) }; }).map(function (m) {
       var ts = m.timestamp != null ? m.timestamp : m.time != null ? m.time : m.ts;
       return { timestamp: ts == null ? '' : String(ts), speaker: normSpeaker(m.speaker || m.role || m.author || m.from), text: String(m.text != null ? m.text : m.message != null ? m.message : m.content != null ? m.content : '') };
     });
@@ -849,9 +851,11 @@ body { margin: 0; }
         group = group || 'Вставленные';
       } else if (body.conversation_id) records = [body];
       if (!records.length) throw ApiError('Нет записей для импорта');
-      var added = 0, bad = [];
+      var added = 0, bad = [], seen = {}, dups = [];
       records.forEach(function (r0, k) {
         var r; try { r = normRecord(clone(r0)); } catch (err) { bad.push('#' + (k + 1) + ': ' + err.message); return; }
+        if (seen[r.conversation_id]) { if (dups.indexOf(r.conversation_id) < 0) dups.push(r.conversation_id); added--; } // повтор ID: остаётся последняя запись
+        seen[r.conversation_id] = 1;
         if (group) r.group = String(group); else if (!r.group) r.group = 'Загружено';
         var old = st.imported[r.conversation_id] || seedIds[r.conversation_id];
         if (old && JSON.stringify(old.transcript) !== JSON.stringify(r.transcript)) { delete st.judgments[r.conversation_id]; delete st.evals[r.conversation_id]; delete st.overrides[r.conversation_id]; touch(r.conversation_id); }
@@ -861,7 +865,7 @@ body { margin: 0; }
       });
       save();
       if (!added) throw ApiError('Ни одна запись не загружена. ' + bad.slice(0, 3).join('; '));
-      return { imported: added, skipped: bad, total: allIds().length, group: group ? String(group) : 'Загружено' };
+      return { imported: added, skipped: bad, duplicates: dups, total: allIds().length, group: group ? String(group) : 'Загружено' };
     }
 
     function addJudgments(convId, cl, todo, res, source, usage, stampAt) {
@@ -1145,11 +1149,16 @@ body { margin: 0; }
     var CODE = { greeting: 'contact', needs: 'discovery', identification: 'identification', consultation: 'consultation',
       empathy: 'empathy', dialog: 'dialogue', closing: 'closure', gross: 'critical' };
     E.submission = function (ids) {
-      var cl = defaultChecklist, models = {}, bad = [];
+      var cl = defaultChecklist, models = {}, bad = [], rules = [];
       var results = ids.map(function (id) {
         var v = buildView(id, cl), ev = st.evals[id] || {};
-        if (!v.evaluated || v.final.total == null) { bad.push(id); return { conversation_id: id, status: 'error', criteria: [], score: null, error: 'Диалог не оценён системой' }; }
-        if (ev.model) models[ev.model] = 1;
+        if (!v.evaluated || v.final.total == null) {
+          bad.push(id);
+          return { conversation_id: id, status: 'error', criteria: [], score: null,
+            error: v.evaluated ? 'Итог не рассчитывается: все критерии с весом получили N/A' : 'Диалог не оценён системой' };
+        }
+        if (v.criteria.some(function (c) { return !isModelSource(c.original.source); })) rules.push(id);
+        else if (ev.model) models[ev.model] = 1;
         var crit = v.criteria.map(function (c) {
           var a = c.final.answer, val = a === 'na' ? null : c.type === SCALE ? Number(a) : a === 'yes';
           var why = c.original.explanation || '';
@@ -1158,7 +1167,7 @@ body { margin: 0; }
         });
         return { conversation_id: id, status: 'ok', criteria: crit, score: { final_score: v.final.total, critical_flag: !!v.final.gross } };
       });
-      return { results: results, models: Object.keys(models), not_evaluated: bad };
+      return { results: results, models: Object.keys(models), not_evaluated: bad, heuristic: rules };
     };
     E.__state = function () { return st; };
     init();
@@ -1194,6 +1203,8 @@ body { margin: 0; }
     function put(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* без хранилища */ } }
     function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
     function $(s, el) { return (el || root).querySelector(s); }
+    /** Номера реплик только целыми числами: данные приходят и из общего хранилища, в разметку — ничего лишнего. */
+    function ints(a) { return (Array.isArray(a) ? a : []).map(Number).filter(function (x) { return isFinite(x) && x >= 0 && x === Math.floor(x); }); }
     function num(v) { return v == null ? '—' : String(Math.round(v * 100) / 100); }
     function cls(v) { return v == null ? '' : v >= 85 ? 'hi' : v >= 60 ? 'mid' : 'lo'; }
     function toast(msg, err) {
@@ -1338,8 +1349,12 @@ body { margin: 0; }
       if (!team) { team = (prompt('Название команды (как вы зарегистрированы у организаторов):') || '').trim(); if (!team) return; put('cqa-team', team); }
       var sub = E.submission(ids);
       if (sub.not_evaluated.length && !confirm('Не оценены по исходному чек-листу: ' + sub.not_evaluated.length + ' из ' + ids.length + ' (' + sub.not_evaluated.slice(0, 5).join(', ') + (sub.not_evaluated.length > 5 ? '…' : '') + ').\nОни попадут в файл со status = "error". Всё равно сохранить?')) return;
+      if (sub.heuristic.length && !confirm('Оценены эвристиками без ИИ: ' + sub.heuristic.length + ' (' + sub.heuristic.slice(0, 5).join(', ') + (sub.heuristic.length > 5 ? '…' : '') + ').\nДля точности сначала оцените их через Gemini («Оценить неоценённые»). Всё равно сохранить?')) return;
       if (set === 'prod' && ids.length !== 10 && !confirm('В prod должно быть ровно 10 записей, а в наборе ' + S.group + ' их ' + ids.length + '. Всё равно сохранить?')) return;
-      var data = { schema_version: '1.0', team_name: team, model: { mode: 'external_api', name: (sub.models.length ? sub.models : [S.modelName || 'gemini']).join(', ') }, results: sub.results };
+      var names = sub.models.slice(), mode = 'external_api';
+      if (sub.heuristic.length) { names.push('эвристики CQA (локально)'); mode = sub.models.length ? 'hybrid' : 'local'; }
+      if (!names.length) names = [S.modelName || 'gemini'];
+      var data = { schema_version: '1.0', team_name: team, model: { mode: mode, name: names.join(', ') }, results: sub.results };
       api('POST', '/save-results', { set: set, data: data }).then(function (r) {
         toast('Сохранено: ' + r.path + ' — записей ' + r.count + ', из них ok: ' + r.ok + '. Теперь commit и push в GitHub Desktop');
       }).catch(function (e) {
@@ -1358,7 +1373,9 @@ body { margin: 0; }
       if (r.group) { S.group = r.group; put(LS.group, r.group); }
       return loadConvs().then(function () {
         if (r.group && groups().indexOf(r.group) >= 0) S.group = r.group;
-        drawList(); toast(what + ': ' + r.imported + ' диалогов в наборе ' + (r.group || '') + (r.skipped && r.skipped.length ? '. Пропущено записей с ошибками: ' + r.skipped.length + ' (' + r.skipped[0] + ')' : ''), r.skipped && r.skipped.length);
+        var dup = r.duplicates || [], warn = (r.skipped && r.skipped.length) || dup.length;
+        drawList(); toast(what + ': ' + r.imported + ' диалогов в наборе ' + (r.group || '') + (r.skipped && r.skipped.length ? '. Пропущено записей с ошибками: ' + r.skipped.length + ' (' + r.skipped[0] + ')' : '') +
+          (dup.length ? '. Повторяются ID: ' + dup.slice(0, 3).join(', ') + (dup.length > 3 ? '…' : '') + ' — оставлена последняя запись' : ''), warn);
         syncCalls(inGroup().filter(function (c) { return c.channel === 'voice call' && c.audio; }).map(function (c) { return c.id; }));
       });
     }
@@ -1395,7 +1412,7 @@ body { margin: 0; }
       var id = rec.conversation_id, info = S.syncInfo[id];
       if (hasSync(id, rec.transcript.length)) {
         if (!info) return '✓ реплики привязаны к записи по распознаванию речи';
-        return info.method === 'words' ? '✓ привязано по распознаванию речи: ' + info.matched + ' из ' + info.speech + ' реплик найдены в записи, остальные — между ними' :
+        return info.method === 'words' ? '✓ привязано по распознаванию речи: ' + Number(info.matched) + ' из ' + Number(info.speech) + ' реплик найдены в записи, остальные — между ними' :
           '≈ слова в записи не распознаны (другой язык или шум) — время по меткам транскрипта с учётом пауз, выровнено по началам речи';
       }
       if (S.syncBusy[id]) return '⏳ привязываю реплики к записи (распознавание речи, ~20–60 с)…';
@@ -1484,7 +1501,8 @@ body { margin: 0; }
       S.offs = voice ? offsets() : null;
       var chat = rec.transcript.map(function (m, i) {
         var t = voice ? mmss(S.offs[i]) : relTs(rec, m.timestamp), sp = WHO[m.speaker] ? m.speaker : 'system';
-        var tt = voice && rec.audio_url ? '<button class="seek" data-act="seek" data-i="' + i + '">' + esc(t) + '</button>' : '<span>' + esc(t) + '</span>';
+        var orig = voice ? ' title="Время в записи. Метка в транскрипте: ' + esc(m.timestamp) + '"' : '';
+        var tt = voice && rec.audio_url ? '<button class="seek" data-act="seek" data-i="' + i + '"' + orig + '>' + esc(t) + '</button>' : '<span' + orig + '>' + esc(t) + '</span>';
         return '<div class="cqa-msg ' + sp + '" id="m' + i + '"><div class="who"><b>№' + (i + 1) + ' ' + (WHO[m.speaker] || esc(m.speaker)) + '</b>' + tt + '</div><div class="txt">' + esc(m.text) + '</div></div>';
       }).join('');
       h += '<div class="cqa-split"><div class="cqa-card cqa-chat" id="chat">' + audio + chat + '</div><div class="cqa-crits">' + critsHtml(v, n) + '</div></div>';
@@ -1622,9 +1640,9 @@ body { margin: 0; }
       if (!c.judged) return h + '<div class="sub">Критерий ещё не оценён — нажмите «Оценить» вверху.</div></div>';
       if (o.answer === 'na' && c.na_condition && !o.explanation) h += '<p class="expl">N/A: ' + esc(c.na_condition) + '</p>';
       if (o.explanation) h += '<p class="expl">' + linkRefs(o.explanation, n) + '</p>';
-      var ev = o.evidence || [];
-      if (ev.length || o.checked) h += '<div class="ev">' + (ev.length ? '<span>Реплики:</span>' + ev.map(function (i) { return '<button class="ref" data-act="goto" data-i="' + i + '">№' + (i + 1) + '</button>'; }).join('') : '') +
-        (o.checked && (o.answer === 'no' || (c.type === 'scale' && o.answer !== maxScale(c) && o.answer !== 'na')) ? '<span>· проверен участок <button class="ref" data-act="goto" data-i="' + o.checked[0] + '">№' + (o.checked[0] + 1) + '</button>–<button class="ref" data-act="goto" data-i="' + o.checked[1] + '">№' + (o.checked[1] + 1) + '</button></span>' : '') + '</div>';
+      var ev = ints(o.evidence), ck = ints(o.checked); ck = ck.length === 2 ? ck : null;
+      if (ev.length || ck) h += '<div class="ev">' + (ev.length ? '<span>Реплики:</span>' + ev.map(function (i) { return '<button class="ref" data-act="goto" data-i="' + i + '">№' + (i + 1) + '</button>'; }).join('') : '') +
+        (ck && (o.answer === 'no' || (c.type === 'scale' && o.answer !== maxScale(c) && o.answer !== 'na')) ? '<span>· проверен участок <button class="ref" data-act="goto" data-i="' + ck[0] + '">№' + (ck[0] + 1) + '</button>–<button class="ref" data-act="goto" data-i="' + ck[1] + '">№' + (ck[1] + 1) + '</button></span>' : '') + '</div>';
       if (o.rule) h += '<div class="sub">Правило кода поправило модель: ' + esc(o.rule) + '</div>';
       if (o.agreement != null && o.agreement < 1) h += '<div class="sub mid">Согласие прогонов модели: ' + Math.round(o.agreement * 100) + '% — оценку стоит проверить</div>';
       c.appeals.forEach(function (a) {
@@ -1666,8 +1684,8 @@ body { margin: 0; }
     function openHtml(a, r) {
       var c = r.view.criteria.filter(function (x) { return x.hash === a.criterion_hash; })[0], tr = r.record.transcript;
       if (!c) return '<div class="cqa-card">' + esc(a.conversation_id) + ': критерий «' + esc(a.criterion_name) + '» изменён в чек-листе. Оцените диалог заново.</div>';
-      var ev = (a.evidence || []).slice(0, 4);
-      var frag = ev.map(function (i) { var m = tr[i]; return m ? '<div class="cqa-msg ' + m.speaker + '"><div class="who"><b>№' + (i + 1) + ' ' + (WHO[m.speaker] || '') + '</b></div><div class="txt">' + esc(m.text) + '</div></div>' : ''; }).join('');
+      var ev = ints(a.evidence).slice(0, 4);
+      var frag = ev.map(function (i) { var m = tr[i]; return m ? '<div class="cqa-msg ' + (WHO[m.speaker] ? m.speaker : 'system') + '"><div class="who"><b>№' + (i + 1) + ' ' + (WHO[m.speaker] || '') + '</b></div><div class="txt">' + esc(m.text) + '</div></div>' : ''; }).join('');
       var opts = allowed(c).filter(function (x) { return x !== a.original_answer; }).map(function (x) { return '<option value="' + x + '">' + ansText(c, x) + '</option>'; }).join('');
       return '<div class="cqa-card cqa-ap" data-aid="' + esc(a.id) + '">' +
         '<div class="row" style="justify-content:space-between"><div><b>' + esc(c.name) + '</b> <span class="mute">· <a href="#/d/' + encodeURIComponent(a.conversation_id) + '" class="mono">' + esc(a.conversation_id) + '</a></span></div>' + ansBadge(c, a.original_answer) + '</div>' +
@@ -1733,6 +1751,14 @@ body { margin: 0; }
       }
       h += '<div class="w4 row" style="justify-content:flex-end"><button class="cqa-btn sm dng" data-act="cl-del" data-i="' + i + '">Удалить критерий</button></div></div>';
       return h;
+    }
+    /** Первая правка чек-листа: «Отменить правки» вместо «Исходных критериев», применять несохранённое нельзя. */
+    function markDirty() {
+      S.dirty = true;
+      var sb = $('[data-act=cl-save]'); if (sb) sb.disabled = false;
+      var d = $('[data-act=cl-default]'); if (d) { d.dataset.act = 'cl-undo'; d.textContent = 'Отменить правки'; }
+      var sel = $('#cl-sel'); if (sel) sel.disabled = true;
+      var ap = $('[data-act=cl-apply]'); if (ap && ap.closest('.note')) ap.closest('.note').remove();
     }
     function saveChecklist(asNew) {
       var cl = JSON.parse(JSON.stringify(S.edit));
@@ -1851,7 +1877,7 @@ body { margin: 0; }
       var t = ev.target;
       if (t.id === 'q') { S.q = t.value; drawTable(); return; }
       if (t.id === 'url') { var g = groupOf(t.value); if (g) $('#gid').value = g; return; }
-      if (t.id === 'cl-name' && S.edit) { S.edit.name = t.value; S.dirty = true; var sb = $('[data-act=cl-save]'); if (sb) sb.disabled = false; return; }
+      if (t.id === 'cl-name' && S.edit) { S.edit.name = t.value; markDirty(); return; }
       var f = t.dataset.f; if (!f || !S.edit) return;
       var c = S.edit.criteria[+t.dataset.i];
       if (f === 'sv') c.scale[+t.dataset.j].value = Number(t.value);
@@ -1859,8 +1885,7 @@ body { margin: 0; }
       else if (f === 'allow_na') c.allow_na = t.checked;
       else if (f === 'weight') c.weight = Number(t.value);
       else c[f] = t.value;
-      S.dirty = true;
-      var btn = $('[data-act=cl-save]'); if (btn) btn.disabled = false;
+      markDirty();
       if (f === 'type' || f === 'allow_na') { if (f === 'type' && c.type === 'flag') c.weight = 0; drawChecklist(); }
     });
     root.addEventListener('change', function (ev) {

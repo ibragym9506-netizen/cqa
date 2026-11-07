@@ -3,11 +3,11 @@
 
 Запуск:  py server.py   →   http://localhost:8000
 """
-import hashlib, html, json, os, re, sys, threading, urllib.request
+import hashlib, html, ipaddress, json, os, re, socket, sys, threading, time, urllib.parse, urllib.request
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import evaluator as ev
@@ -18,6 +18,66 @@ LOCK = threading.Lock()  # оценки идут по одной: у беспл�
 TYPES = {"yesno": "binary", "binary": "binary", "scale": "scale", "flag": "flag"}
 
 app = FastAPI(title="CQA — оценка качества диалогов")
+MAX_BODY = 30_000_000       # самый большой запрос к серверу (общее хранилище с набором ~1–2 МБ)
+MAX_DATASET = 50_000_000    # ответ API организаторов
+MAX_AUDIO = 200_000_000     # запись звонка
+
+
+@app.middleware("http")
+async def limit_body(request, call_next):
+    n = request.headers.get("content-length") or ""
+    if n.isdigit() and int(n) > MAX_BODY:
+        return JSONResponse({"detail": "Слишком большой запрос"}, status_code=413)
+    return await call_next(request)
+
+
+# ---------- исходящие запросы: только публичные адреса (защита от SSRF) ----------
+ALLOW_LOCAL = os.getenv("ALLOW_LOCAL_URLS") == "1"  # для тестов с локальной заглушкой API
+
+
+def check_url(u):
+    """Сервер скачивает по ссылкам из интерфейса. Чтобы через него нельзя было достучаться до
+    внутренних адресов (localhost, локальная сеть, метаданные облака), разрешаем только публичные."""
+    p = urllib.parse.urlsplit(u or "")
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("нужна ссылка http(s)")
+    if ALLOW_LOCAL:
+        return
+    try:
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError):
+        return  # имя не разрешилось здесь (например, работа через прокси) — пусть решает сам запрос
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError("ссылки на локальные и внутренние адреса запрещены")
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_url(newurl)  # переадресация тоже не должна уводить во внутреннюю сеть
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_CheckedRedirect)
+
+
+def open_url(u, timeout, headers=None):
+    check_url(u)
+    return _OPENER.open(urllib.request.Request(u, headers={"User-Agent": "cqa-hackathon", **(headers or {})}), timeout=timeout)
+
+
+def read_limited(r, limit):
+    data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"файл больше {limit // 1_000_000} МБ")
+    return data
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
 
 # ---------- приведение чужих данных к единому виду ----------
 ROLES = [("system", ("system", "систем", "event", "событ", "жүйе")),
@@ -66,10 +126,8 @@ def norm_record(rec, n=0):
             tr = [{"speaker": m.group(1), "text": m.group(2)} for m in re.finditer(r"^\s*([^:\n]{1,30}):\s*(.+)$", tr, re.M)]
     out = []
     for m in tr if isinstance(tr, list) else []:
-        if isinstance(m, str):
-            m = {"text": m}
-        if not isinstance(m, dict):
-            continue
+        if not isinstance(m, dict):  # не пропускаем: номера реплик должны совпадать с исходным массивом
+            m = {"text": "" if m is None else str(m)}
         out.append({"timestamp": str(m.get("timestamp") or m.get("time") or m.get("ts") or ""),
                     "speaker": norm_speaker(m.get("speaker") or m.get("role") or m.get("author") or m.get("from")),
                     "text": str(m.get("text") or m.get("message") or m.get("content") or "")})
@@ -130,7 +188,10 @@ def run(rec, criteria, extra="", votes=None):
     if not isinstance(rec, dict) or not isinstance(rec.get("transcript"), list) or not criteria:
         raise HTTPException(400, "Нужны record (с transcript) и criteria")
     rec = norm_record(rec)
-    cl = to_checklist(criteria)
+    try:
+        cl = to_checklist(criteria)
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise HTTPException(400, f"Некорректный чек-лист: {e}")
     with LOCK:
         try:
             res = ev.evaluate(rec, cl, extra=extra, votes=votes)
@@ -167,19 +228,19 @@ def second_opinion(body: dict = Body(...)):
 @app.post("/api/fetch")
 def fetch_dataset(body: dict = Body(...)):
     """Загрузка набора по ссылке организаторов (GET ...?group_id=...) — через сервер, без CORS."""
-    url = (body.get("url") or "").strip()
+    url = str(body.get("url") or "").strip()
     if not re.match(r"^https?://", url):
         raise HTTPException(400, "Нужна ссылка http(s)")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "cqa-hackathon"})
-        with urllib.request.urlopen(req, timeout=90) as r:
-            data = json.loads(r.read().decode("utf-8-sig"))
+        with open_url(url, 90) as r:
+            data = json.loads(read_limited(r, MAX_DATASET).decode("utf-8-sig"))
     except Exception as e:
         raise HTTPException(502, f"Не удалось загрузить набор: {str(e)[:200]}")
     if isinstance(data, dict) and data.get("isSuccess") is False:
         raise HTTPException(502, f"API организаторов вернул ошибку: {data.get('error')}")
     # копия набора на диск — её можно прогнать батчем: py batch.py data_<group>.json
-    gid = re.sub(r"[^\w-]", "_", str(((data or {}).get("data") or {}).get("dataset_group_id") or "dataset"))
+    d = data.get("data") if isinstance(data, dict) else None
+    gid = re.sub(r"[^\w-]", "_", str((d if isinstance(d, dict) else {}).get("dataset_group_id") or "dataset"))[:60]
     with open(os.path.join(BASE, f"data_{gid}.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     return data
@@ -187,15 +248,16 @@ def fetch_dataset(body: dict = Body(...)):
 
 def audio_file_url(u):
     """audio_url организаторов → прямая ссылка на файл записи (страница с плеером → src файла)."""
-    req = urllib.request.Request(u, headers={"User-Agent": "cqa-hackathon", "Range": "bytes=0-0"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with open_url(u, 60, {"Range": "bytes=0-0"}) as r:
         if (r.headers.get("Content-Type") or "").startswith("audio/"):
             return u
         page = r.read(200_000).decode("utf-8", "replace")
     m = re.search(r'<source[^>]+src="(https?://[^"]+)"', page) or re.search(r'<audio[^>]+src="(https?://[^"]+)"', page)
     if not m:
         raise ValueError("на странице записи не найден аудиофайл")
-    return html.unescape(m.group(1))
+    src = html.unescape(m.group(1))
+    check_url(src)
+    return src
 
 
 SYNC_LOCK = threading.Lock()
@@ -209,12 +271,12 @@ def sync_audio(body: dict = Body(...)):
     rec = norm_record(body.get("record") or {})
     if not rec.get("audio_url"):
         raise HTTPException(400, "У записи нет audio_url")
-    cid = re.sub(r"[^\w-]", "_", rec["conversation_id"])
+    cid = re.sub(r"[^\w-]", "_", rec["conversation_id"])[:80]
     key = hashlib.sha1(json.dumps([[m["speaker"], m["text"], m["timestamp"]] for m in rec["transcript"]],
                                   ensure_ascii=False).encode()).hexdigest()[:12]
     cache = os.path.join(BASE, "sync_cache", f"{cid}_{key}.json")
     if os.path.exists(cache):
-        return json.load(open(cache, encoding="utf-8"))
+        return read_json(cache)
     if TOOLS not in sys.path:
         sys.path.insert(0, TOOLS)
     try:
@@ -223,12 +285,11 @@ def sync_audio(body: dict = Body(...)):
         raise HTTPException(501, f"Распознавание речи не установлено (pip install sherpa-onnx soundfile): {e}")
     with SYNC_LOCK:
         if os.path.exists(cache):
-            return json.load(open(cache, encoding="utf-8"))
+            return read_json(cache)
         try:
             src = audio_file_url(rec["audio_url"])
-            req = urllib.request.Request(src, headers={"User-Agent": "cqa-hackathon"})
-            with urllib.request.urlopen(req, timeout=180) as r:
-                ctype, data = (r.headers.get("Content-Type") or "").split(";")[0].strip(), r.read()
+            with open_url(src, 180) as r:
+                ctype, data = (r.headers.get("Content-Type") or "").split(";")[0].strip(), read_limited(r, MAX_AUDIO)
             ext = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/mp4": "m4a"}.get(ctype, "mp3")
             os.makedirs(os.path.join(BASE, "audio"), exist_ok=True)
             path = os.path.join(BASE, "audio", f"{cid}.{ext}")
@@ -264,8 +325,7 @@ _state = {"version": 0, "state": None}
 def _load_state():
     if _state["state"] is None and os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                saved = json.load(f)
+            saved = read_json(STATE_FILE)
             _state.update(version=saved.get("version", 0), state=saved.get("state"))
         except Exception:
             pass  # битый файл — начнём заново, старый не трогаем
@@ -344,7 +404,10 @@ def put_state(body: dict = Body(...)):
         raise HTTPException(400, "Нужен state с checklists")
     with STATE_LOCK:
         st = _load_state()
-        merged = merge_state(st["state"], incoming)
+        try:
+            merged = merge_state(st["state"], incoming)
+        except (AttributeError, TypeError, KeyError, ValueError):
+            raise HTTPException(400, "Некорректный формат состояния")
         if merged != st["state"]:
             st["state"], st["version"] = merged, st["version"] + 1
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -364,6 +427,8 @@ def save_results(body: dict = Body(...)):
     kind, data = body.get("set"), body.get("data")
     if kind not in ("dev", "prod") or not isinstance(data, dict) or not isinstance(data.get("results"), list):
         raise HTTPException(400, "Нужны set (dev или prod) и data.results")
+    if not all(isinstance(r, dict) for r in data["results"]):
+        raise HTTPException(400, "Каждая запись results — объект")
     ids = [r.get("conversation_id") for r in data["results"]]
     if len(ids) != len(set(ids)) or not all(ids):
         raise HTTPException(400, "Пустые или повторяющиеся conversation_id")
@@ -372,7 +437,12 @@ def save_results(body: dict = Body(...)):
             raise HTTPException(400, f"{r['conversation_id']}: нужны ровно 8 критериев {CODES}")
     folder = os.path.join(BASE, "results", kind)
     os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, "results.json"), "w", encoding="utf-8") as f:
+    path = os.path.join(folder, "results.json")
+    if os.path.exists(path):  # прежний файл не теряем: копия в data/backup (data/ не попадает в Git)
+        bak = os.path.join(BASE, "data", "backup")
+        os.makedirs(bak, exist_ok=True)
+        os.replace(path, os.path.join(bak, f"results_{kind}_{time.strftime('%Y%m%d_%H%M%S')}.json"))
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return {"path": f"results/{kind}/results.json", "count": len(ids),
             "ok": sum(1 for r in data["results"] if r.get("status") == "ok")}
@@ -389,8 +459,7 @@ def precomputed():
             if not name.endswith(".json"):
                 continue
             try:
-                with open(os.path.join(folder, name), encoding="utf-8") as f:
-                    r = json.load(f)
+                r = read_json(os.path.join(folder, name))
             except Exception:
                 continue
             keep = ("id", "name", "answer", "score", "explanation", "quote", "evidence", "checked_range")
