@@ -44,9 +44,11 @@ SYSTEM = """Ты — строгий эксперт по контролю кач�
 - evidence: номера реплик [i], на которых основан вывод.
 - checked_range: [начало, конец] — участок диалога, который ты проверял.
 - explanation: итог для человека, например: «Завершение — Нет. После ответа оператор закрыл чат без прощания. Основание — [12], [13].»
+- В reasoning и explanation ссылайся на другие критерии по НАЗВАНИЮ («см. Консультация»), а не по id.
 
 Ответ — строго JSON без текста вокруг, по объекту на КАЖДЫЙ критерий чек-листа:
-{"criteria":[{"id":"c01","quote":"[9] ...","reasoning":"...","answer":"YES","score":null,"evidence":[9],"checked_range":[9,9],"explanation":"..."}]}"""
+{"criteria":[{"id":"<id критерия из чек-листа>","quote":"[9] ...","reasoning":"...","answer":"YES","score":null,"evidence":[9],"checked_range":[9,9],"explanation":"..."}]}
+В поле id пиши ТОЧНО тот id, который указан у критерия в чек-листе."""
 
 
 # ---------- уточнения к стандартным критериям ----------
@@ -68,7 +70,9 @@ HINTS = [
      "проверка личности перед защищённым действием и она не подтверждена — NO. Если оператор сообщил сведения о конкретном "
      "счёте (ограничения, позиции, статус поручения) ДО подтверждения личности — NO; если клиент возразил, а оператор "
      "отмахнулся («подтверждение не нужно», «We can skip that», «Қазір растаудың қажеті жоқ») — тоже NO. YES — подтверждение "
-     "(системное сообщение или проверка данных в звонке) прошло до раскрытия данных или защищённого действия."),
+     "(системное сообщение или проверка данных в звонке) прошло до раскрытия данных или защищённого действия. "
+     "Раскрытие — это сведения, взятые из счёта клиента («вижу ограничение на вашем счёте», «ваше поручение в обработке»). "
+     "Догадка оператора без просмотра счёта («наверное, биржа отменяет») — не раскрытие, это ошибка консультации."),
     ("консультац", "существенн",
      "В reasoning перечисли ВСЕ вопросы клиента к оператору и отметь, ответил ли оператор по существу на каждый. Реплика, "
      "которая повторяет уже сказанное или говорит о другом («Путь к обновлению я указал», «Название тарифа смотрите там же»), — "
@@ -84,10 +88,13 @@ HINTS = [
      "при коллегах», «nervous», возражение о безопасности своих данных), оператор должен отреагировать на ЭТУ проблему: "
      "признать её или предложить решение именно для неё. Дежурное «понимаю, но…», перекладывание вины («вас неправильно "
      "проинформировали»), сухой отказ, отмахивание — NO. Если поводов не было, достаточно вежливости. Предложение платной "
-     "услуги и раскрытие данных сами по себе эмпатию не снижают — это грубые ошибки."),
+     "услуги и раскрытие данных сами по себе эмпатию не снижают — это грубые ошибки: реплику с таким предложением при оценке "
+     "эмпатии пропусти и оцени остальное общение."),
     ("управлени", "переспраш",
      "Оценивай ясность, связность, порядок ответов и предупреждение об ожидании — НЕ полноту ответа (её оценивает "
      "консультация: ясный ответ на один из двух вопросов может получить высокий балл здесь и частичный в консультации). "
+     "Неотвеченный вопрос, ответ не на тот вопрос или повтор уже сказанного здесь НЕ снижают балл — за это уже снижена "
+     "консультация; снижай, только если клиенту пришлось переспросить из-за неясной формулировки оператора. "
      "4 — клиенту пришлось переспросить или поправить оператора из-за его формулировки или ошибки («В каком меню?», «Какое "
      "приложение?», «Settings where?», «Профильде ондай бөлім жоқ», «Не, я имею в виду…»). 7 — один заметный сбой, который "
      "клиенту не пришлось исправлять (неточность, долгая пауза без предупреждения — см. ФАКТЫ). 0 — противоречивые реплики "
@@ -358,22 +365,45 @@ def code_rules(conv, cl):
     return rules
 
 
+DISCLOSED = re.compile(r"раскры|сообщил|озвучил|disclos", re.I)
+
+
 def apply_rules(conv, cl, answers):
     notes = []
-    for cid, (ans, expl) in code_rules(conv, cl).items():
+    rules = code_rules(conv, cl)
+
+    # «Попрощался, оставив последний вопрос клиента без ответа»: клиент закончил вопросом,
+    # оператор ответил прощанием, а консультация признала существенный вопрос открытым (≤ 10)
+    comp, cons = find_crit(cl, "завершени", "попрощ"), find_crit(cl, "консультац", "существенн")
+    ops = operator_lines(conv)
+    if comp and cons and ops and comp["id"] not in rules:
+        sc = answers.get(cons["id"], {})
+        oi, ot = ops[-1]
+        prev = [(i, m["text"]) for i, m in enumerate(conv["transcript"]) if m["speaker"] == "client" and i < oi]
+        passed_on = re.search(r"переда|специалист|отдел|жолда|жібер|тексеруге|send it|pass|escalat|team", ot, re.I)
+        if sc.get("answer") == "YES" and (sc.get("score") or 0) <= 10 and BYE.search(ot) and not passed_on \
+                and prev and prev[-1][1].strip().endswith("?"):
+            rules[comp["id"]] = ("NO", f"{comp['name']} — Нет. Оператор попрощался, оставив вопрос клиента "
+                                       f"[{prev[-1][0]}] без ответа (см. «{cons['name']}»). Основание — [{oi}].")
+
+    for cid, (ans, expl) in rules.items():
         if cid in answers and answers[cid].get("answer") != ans:
             notes.append(f"{cid}: модель {answers[cid].get('answer')} → правило {ans}")
             answers[cid] = dict(answers[cid], answer=ans, score=None, explanation=expl)
+
     # раскрытие данных до идентификации — всегда грубая ошибка
+    # (только если «Нет» по идентификации поставлено именно за раскрытие сведений)
     idc = find_crit(cl, "идентификац", "личност")
     flag = next((c for c in cl["criteria"] if c["type"] == "flag" and "раскрыт" in _ctext(c)), None)
-    if idc and flag and answers.get(idc["id"], {}).get("answer") == "NO" \
+    ida = answers.get(idc["id"], {}) if idc else {}
+    why = " ".join(str(ida.get(k) or "") for k in ("explanation", "reasoning"))
+    if idc and flag and ida.get("answer") == "NO" and DISCLOSED.search(why) \
             and answers.get(flag["id"], {}).get("answer") != "YES":
         notes.append(f"{flag['id']}: модель NO → правило YES ({idc['id']} = NO)")
         answers[flag["id"]] = dict(answers[flag["id"]], answer="YES",
                                    evidence=answers[idc["id"]].get("evidence", []),
                                    explanation=f"{flag['name']} — Да. Сведения о счёте раскрыты до идентификации "
-                                               f"(см. {idc['id']}).")
+                                               f"(см. «{idc['name']}»).")
     return notes
 
 
@@ -456,7 +486,13 @@ def call_llm(prompt, need_ids):
                         response_mime_type="application/json",
                         response_schema=EvalOut))
                 data = parse_json(r.text)
-                got = {it.get("id") for it in data.get("criteria", [])}
+                items = data.get("criteria", [])
+                got = {it.get("id") for it in items}
+                # модель перепутала id (например, c01 вместо greeting), но вернула все критерии по порядку
+                if not (got & set(need_ids)) and len(items) == len(need_ids):
+                    for it, cid in zip(items, need_ids):
+                        it["id"] = cid
+                    got = set(need_ids)
                 missing = [c for c in need_ids if c not in got]
                 if missing:
                     raise ValueError(f"нет оценок для {missing}")
@@ -471,11 +507,11 @@ def call_llm(prompt, need_ids):
     raise RuntimeError(f"Все модели недоступны: {last}")
 
 
-def vote(prompt, ids, llm=None):
+def vote(prompt, ids, llm=None, votes=None):
     llm = llm or call_llm
     runs, model = [], None
     usage = {"input_tokens": 0, "output_tokens": 0}
-    for _ in range(VOTES):
+    for _ in range(votes or VOTES):
         data, model, u = llm(prompt, ids)
         items = data.get("criteria", []) if isinstance(data, dict) else data
         for it in items:
@@ -498,30 +534,35 @@ def vote(prompt, ids, llm=None):
     return answers, model, usage, agreement
 
 
-def build_prompt(conv, cl):
-    return (f"ЧЕК-ЛИСТ:\n{checklist_text(cl)}\n\n"
+def build_prompt(conv, cl, extra=""):
+    ids = ", ".join(c["id"] for c in cl["criteria"])
+    return (f"ЧЕК-ЛИСТ (id критериев: {ids}):\n{checklist_text(cl)}\n\n"
             f"ФАКТЫ (извлечены кодом):\n{facts(conv)}\n\n"
             f"ДИАЛОГ {conv['conversation_id']} (канал: {conv['channel']}, язык: {conv['language']}):\n"
-            f"{transcript_text(conv)}\n\nВерни JSON.")
+            f"{transcript_text(conv)}\n\n" + (f"{extra}\n\n" if extra else "") + "Верни JSON.")
 
 
-def evaluate(conv, cl, llm=None):
+def evaluate(conv, cl, llm=None, extra="", votes=None):
     ids = [c["id"] for c in cl["criteria"]]
-    answers, model, usage, agreement = vote(build_prompt(conv, cl), ids, llm)
+    answers, model, usage, agreement = vote(build_prompt(conv, cl, extra), ids, llm, votes)
     rule_notes = apply_rules(conv, cl, answers)
 
     result = compute(cl, answers)
+    # служебные id критериев (consultation, c04…) в текстах для человека → названия
+    names = {c["id"]: c.get("name") or c["id"] for c in cl["criteria"]}
+    id_re = re.compile(r"(?<![\w«])(" + "|".join(map(re.escape, sorted(names, key=len, reverse=True))) + r")(?![\w»])")
+    human = lambda s: id_re.sub(lambda m: f"«{names[m.group(1)]}»", s or "")
     for r in result["criteria"]:
         a = answers.get(r["id"], {})
-        r["explanation"] = a.get("explanation", "")
-        r["reasoning"] = a.get("reasoning", "")
+        r["explanation"] = human(a.get("explanation", ""))
+        r["reasoning"] = human(a.get("reasoning", ""))
         r["quote"] = a.get("quote", "")
         r["evidence"] = a.get("evidence", [])
         r["checked_range"] = a.get("checked_range")
     disputed = [c for c, v in agreement.items() if v < 1]
     flag_ids = [c["id"] for c in cl["criteria"] if c["type"] == "flag"]
     result.update({"conversation_id": conv["conversation_id"], "checklist_id": cl["id"],
-                   "model": model, "usage": usage, "agreement": agreement,
+                   "model": model, "usage": dict(usage, calls=votes or VOTES), "agreement": agreement,
                    "rule_overrides": rule_notes,
                    "needs_review": len(disputed) >= 2 or any(f in disputed for f in flag_ids)})
     return result
