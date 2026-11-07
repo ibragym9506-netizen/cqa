@@ -576,11 +576,11 @@ def _limit_kind(e):
     s = str(e)
     if "401" in s or "UNAUTHENTICATED" in s or "API key not valid" in s or "PERMISSION_DENIED" in s:
         return "key"
-    if any(x in s for x in ("503", "504", "500 ", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "overloaded", "high demand")):
+    if "429" in s or "RESOURCE_EXHAUSTED" in s or "quota" in s.lower():  # лимит проверяем первым: в его тексте бывают числа вроде «500»
+        return "day" if ("PerDay" in s or "per day" in s.lower()) else "minute"
+    if any(x in s for x in ("503", "504", "500 INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "overloaded", "high demand")):
         return "busy"
-    if "429" not in s and "RESOURCE_EXHAUSTED" not in s and "quota" not in s.lower():
-        return None
-    return "day" if ("PerDay" in s or "per day" in s.lower()) else "minute"
+    return None
 
 
 def call_llm(prompt, need_ids):
