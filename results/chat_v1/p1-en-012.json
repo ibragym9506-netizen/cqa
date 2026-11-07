@@ -1,0 +1,198 @@
+{
+ "criteria": [
+  {
+   "id": "c01",
+   "name": "Установление контакта",
+   "section": "Начало и понимание запроса",
+   "type": "binary",
+   "weight": 10,
+   "answer": "YES",
+   "score": null,
+   "raw_points": 10,
+   "points": 15.38,
+   "max_points": 15.38,
+   "explanation": "The operator successfully established contact by greeting the client and providing his name in the first response.",
+   "reasoning": "The operator greeted the client and introduced himself by name in the first message.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c02",
+   "name": "Выявление потребности",
+   "section": "Начало и понимание запроса",
+   "type": "binary",
+   "weight": 15,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "The request was straightforward, and the operator addressed it directly without needing further clarification.",
+   "reasoning": "The client's request was clear, and the operator provided the necessary information immediately.",
+   "evidence": [
+    4,
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c03",
+   "name": "Идентификация",
+   "section": "Безопасность и решение",
+   "type": "binary",
+   "weight": 20,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Identification is not required for general inquiries about public company information.",
+   "reasoning": "The request was for public information (financial statements), which does not require account identification.",
+   "evidence": [
+    0,
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c04",
+   "name": "Корректная и полная консультация",
+   "section": "Безопасность и решение",
+   "type": "scale",
+   "weight": 20,
+   "answer": "YES",
+   "score": 20,
+   "raw_points": 20.0,
+   "points": 30.77,
+   "max_points": 30.77,
+   "explanation": "The operator fully answered the client's question regarding where to find financial statements.",
+   "reasoning": "The operator provided the exact navigation path requested by the client.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c05",
+   "name": "Эмпатия и клиентоориентированность",
+   "section": "Ведение и завершение диалога",
+   "type": "binary",
+   "weight": 15,
+   "answer": "YES",
+   "score": null,
+   "raw_points": 15,
+   "points": 23.08,
+   "max_points": 23.08,
+   "explanation": "The operator maintained a professional and polite tone.",
+   "reasoning": "The operator was polite and helpful throughout the interaction.",
+   "evidence": [
+    9,
+    11
+   ],
+   "checked_range": [
+    9,
+    11
+   ]
+  },
+  {
+   "id": "c06",
+   "name": "Управление диалогом, скорость и грамотность",
+   "section": "Ведение и завершение диалога",
+   "type": "scale",
+   "weight": 15,
+   "answer": "YES",
+   "score": 10,
+   "raw_points": 15.0,
+   "points": 23.08,
+   "max_points": 23.08,
+   "explanation": "The operator's responses were clear and directly addressed the client's needs.",
+   "reasoning": "The communication was clear, concise, and professional.",
+   "evidence": [
+    9,
+    11
+   ],
+   "checked_range": [
+    9,
+    11
+   ]
+  },
+  {
+   "id": "c07",
+   "name": "Завершение",
+   "section": "Ведение и завершение диалога",
+   "type": "binary",
+   "weight": 5,
+   "answer": "NO",
+   "score": null,
+   "raw_points": 0.0,
+   "points": 0.0,
+   "max_points": 7.69,
+   "explanation": "The operator only said goodbye without offering further help or summarizing the resolution.",
+   "reasoning": "The operator said goodbye, but failed to offer further assistance or summarize the interaction.",
+   "evidence": [
+    11
+   ],
+   "checked_range": [
+    11,
+    11
+   ]
+  },
+  {
+   "id": "c08",
+   "name": "Грубые ошибки",
+   "section": "Грубые нарушения",
+   "type": "flag",
+   "weight": 0,
+   "answer": "NO",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "The operator followed all professional standards.",
+   "reasoning": "No gross violations were identified in the dialogue.",
+   "evidence": [
+    9,
+    11
+   ],
+   "checked_range": [
+    9,
+    11
+   ]
+  }
+ ],
+ "sections": {
+  "Начало и понимание запроса": {
+   "points": 15.38,
+   "max": 15.38
+  },
+  "Безопасность и решение": {
+   "points": 30.77,
+   "max": 30.77
+  },
+  "Ведение и завершение диалога": {
+   "points": 46.16,
+   "max": 53.85
+  }
+ },
+ "total": 92.31,
+ "gross_error": false,
+ "applicable_weight": 65.0,
+ "conversation_id": "p1-en-012",
+ "checklist_id": "chat_v1",
+ "model": "gemini-3.1-flash-lite",
+ "usage": {
+  "input_tokens": 2192,
+  "output_tokens": 774
+ }
+}

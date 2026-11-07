@@ -1,0 +1,192 @@
+{
+ "criteria": [
+  {
+   "id": "c01",
+   "name": "Установление контакта",
+   "section": "Начало и понимание запроса",
+   "type": "binary",
+   "weight": 10,
+   "answer": "YES",
+   "score": null,
+   "raw_points": 10,
+   "points": 25.0,
+   "max_points": 25.0,
+   "explanation": "Установление контакта выполнено корректно.",
+   "reasoning": "Оператор поздоровалась и назвала своё имя и компанию в первом же сообщении.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c02",
+   "name": "Выявление потребности",
+   "section": "Начало и понимание запроса",
+   "type": "binary",
+   "weight": 15,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Выявление потребности не применимо, так как клиент ушёл до вопроса.",
+   "reasoning": "Клиент запросил оператора, но ещё не успел озвучить саму проблему до того, как покинул чат.",
+   "evidence": [
+    4,
+    6,
+    10
+   ],
+   "checked_range": [
+    9,
+    10
+   ]
+  },
+  {
+   "id": "c03",
+   "name": "Идентификация",
+   "section": "Безопасность и решение",
+   "type": "binary",
+   "weight": 20,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Идентификация не требовалась в данном отрезке.",
+   "reasoning": "Оператор не успела запросить или раскрыть данные счёта до завершения диалога.",
+   "evidence": [
+    9,
+    10
+   ],
+   "checked_range": [
+    9,
+    10
+   ]
+  },
+  {
+   "id": "c04",
+   "name": "Корректная и полная консультация",
+   "section": "Безопасность и решение",
+   "type": "scale",
+   "weight": 20,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Консультация неприменима, запрос не поступил.",
+   "reasoning": "Клиент не сформулировал свой вопрос по существу, чат прервался.",
+   "evidence": [
+    4,
+    6,
+    10
+   ],
+   "checked_range": [
+    9,
+    10
+   ]
+  },
+  {
+   "id": "c05",
+   "name": "Эмпатия и клиентоориентированность",
+   "section": "Ведение и завершение диалога",
+   "type": "binary",
+   "weight": 15,
+   "answer": "YES",
+   "score": null,
+   "raw_points": 15,
+   "points": 37.5,
+   "max_points": 37.5,
+   "explanation": "Эмпатия и клиентоориентированность соблюдены.",
+   "reasoning": "Оператор ответила вежливо, поводов для эмпатии не было.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c06",
+   "name": "Управление диалогом, скорость и грамотность",
+   "section": "Ведение и завершение диалога",
+   "type": "scale",
+   "weight": 15,
+   "answer": "YES",
+   "score": 10,
+   "raw_points": 15.0,
+   "points": 37.5,
+   "max_points": 37.5,
+   "explanation": "Управление диалогом и грамотность на высшем уровне.",
+   "reasoning": "Реплика оператора ясная, связная и грамотная.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    9
+   ]
+  },
+  {
+   "id": "c07",
+   "name": "Завершение",
+   "section": "Ведение и завершение диалога",
+   "type": "binary",
+   "weight": 5,
+   "answer": "NA",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Завершение неприменимо из-за ухода клиента.",
+   "reasoning": "Чат оборвался (клиент покинул чат) до того, как оператор успела завершить диалог.",
+   "evidence": [
+    10
+   ],
+   "checked_range": [
+    9,
+    10
+   ]
+  },
+  {
+   "id": "c08",
+   "name": "Грубые ошибки",
+   "section": "Грубые нарушения",
+   "type": "flag",
+   "weight": 0,
+   "answer": "NO",
+   "score": null,
+   "raw_points": null,
+   "points": null,
+   "explanation": "Грубые ошибки отсутствуют.",
+   "reasoning": "Грубых ошибок, оскорблений или утечки данных в диалоге нет.",
+   "evidence": [
+    9
+   ],
+   "checked_range": [
+    9,
+    10
+   ]
+  }
+ ],
+ "sections": {
+  "Начало и понимание запроса": {
+   "points": 25.0,
+   "max": 25.0
+  },
+  "Ведение и завершение диалога": {
+   "points": 75.0,
+   "max": 75.0
+  }
+ },
+ "total": 100.0,
+ "gross_error": false,
+ "applicable_weight": 40.0,
+ "conversation_id": "p1-ru-025",
+ "checklist_id": "chat_v1",
+ "model": "gemini-3.5-flash-lite",
+ "usage": {
+  "input_tokens": 2166,
+  "output_tokens": 547
+ }
+}
